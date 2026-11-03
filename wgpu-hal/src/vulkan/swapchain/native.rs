@@ -257,23 +257,6 @@ impl Surface for NativeSurface {
         let images = unsafe { functor.get_swapchain_images(raw) }
             .map_err(crate::vulkan::map_host_device_oom_err)?;
 
-        // This fence is only used to throttle acquisition on Windows. It is very important to
-        // avoid bad frame pacing when the Vulkan driver is using a DXGI swapchain. See
-        // https://github.com/gfx-rs/wgpu/issues/8310 and
-        // https://github.com/gfx-rs/wgpu/issues/8354 for more details.
-        let fence = if cfg!(target_os = "windows") {
-            let raw = unsafe {
-                device
-                    .shared
-                    .raw
-                    .create_fence(&vk::FenceCreateInfo::default(), None)
-                    .map_err(crate::vulkan::map_host_device_oom_err)?
-            };
-            Some(raw)
-        } else {
-            None
-        };
-
         // NOTE: It's important that we define the same number of acquire/present semaphores
         // as we will need to index into them with the image index.
         let acquire_semaphores = (0..images.len())
@@ -293,7 +276,6 @@ impl Surface for NativeSurface {
             functor,
             device: Arc::clone(&device.shared),
             images,
-            fence,
             config: config.clone(),
             acquire_semaphores,
             next_acquire_index: 0,
@@ -317,8 +299,6 @@ pub(crate) struct NativeSwapchain {
     functor: khr::swapchain::Device,
     device: Arc<DeviceShared>,
     images: Vec<vk::Image>,
-    /// Fence used to wait on the acquired image.
-    fence: Option<vk::Fence>,
     config: crate::SurfaceConfiguration,
 
     /// Semaphores used between image acquisition and the first submission
@@ -391,10 +371,6 @@ impl Swapchain for NativeSwapchain {
             };
         };
 
-        if let Some(fence) = self.fence {
-            unsafe { device.shared.raw.destroy_fence(fence, None) }
-        }
-
         // We cannot take this by value, as the function returns `self`.
         for semaphore in self.acquire_semaphores.drain(..) {
             let arc_removed = Arc::into_inner(semaphore).expect(
@@ -466,8 +442,6 @@ impl Swapchain for NativeSwapchain {
             return Err(crate::SurfaceError::Timeout);
         }
 
-        let acquire_fence = self.fence.unwrap_or_else(vk::Fence::null);
-
         // will block if no image is available
         let (index, suboptimal) = match unsafe {
             profiling::scope!("vkAcquireNextImageKHR");
@@ -475,7 +449,7 @@ impl Swapchain for NativeSwapchain {
                 self.raw,
                 timeout_ns,
                 acquire_semaphore_guard.acquire,
-                acquire_fence,
+                vk::Fence::null(),
             )
         } {
             // We treat `VK_SUBOPTIMAL_KHR` as `VK_SUCCESS` on Android.
@@ -498,20 +472,9 @@ impl Swapchain for NativeSwapchain {
             }
         };
 
-        if let Some(fence) = self.fence {
-            unsafe {
-                // The `wait_all` argument must be `true` to avoid crash on some Android devices. See https://github.com/gfx-rs/wgpu/pull/8769
-                self.device
-                    .raw
-                    .wait_for_fences(&[fence], true, timeout_ns)
-                    .map_err(map_host_device_oom_and_lost_err)?;
-
-                self.device
-                    .raw
-                    .reset_fences(&[fence])
-                    .map_err(map_host_device_oom_and_lost_err)?;
-            }
-        }
+        // The acquire semaphore alone orders rendering after the image is free. Waiting on an
+        // acquire fence as well (gfx-rs/wgpu#8310, #8354) blocks the CPU on AMD's DXGI-backed
+        // Windows swapchain until the image is free, costing about 2 ms of every frame.
 
         drop(acquire_semaphore_guard);
         // We only advance the surface semaphores if we successfully acquired an image, otherwise
