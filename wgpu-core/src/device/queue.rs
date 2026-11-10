@@ -13,7 +13,10 @@ use wgt::{
     AccelerationStructureFlags,
 };
 
-use super::{life::LifetimeTracker, Device};
+use super::{
+    life::{EncoderRelease, LifetimeTracker},
+    Device,
+};
 #[cfg(feature = "trace")]
 use crate::device::trace::{Action, IntoTrace};
 use crate::{
@@ -239,6 +242,7 @@ impl Queue {
         &self,
         submission_index: u64,
         snatch_guard: &SnatchGuard,
+        encoder_release: EncoderRelease,
     ) -> (
         SmallVec<[SubmittedWorkDoneClosure; 1]>,
         Vec<super::BufferMapPendingClosure>,
@@ -246,7 +250,8 @@ impl Queue {
         bool,
     ) {
         let mut life_tracker = self.lock_life();
-        let submission_closures = life_tracker.triage_submissions(submission_index);
+        let submission_closures =
+            life_tracker.triage_submissions(submission_index, encoder_release);
 
         let mapping_closures = life_tracker.handle_mapping(snatch_guard);
         let blas_closures = life_tracker.handle_compact_read_back();
@@ -295,7 +300,11 @@ impl Drop for Queue {
 
         let snatch_guard = self.device.snatchable_lock.read();
         let (submission_closures, mapping_closures, blas_compact_ready_closures, queue_empty) =
-            self.maintain(last_successful_submission_index, &snatch_guard);
+            self.maintain(
+                last_successful_submission_index,
+                &snatch_guard,
+                EncoderRelease::AtOnce,
+            );
         drop(snatch_guard);
 
         assert!(queue_empty);
@@ -1445,40 +1454,38 @@ impl Queue {
                             break 'error Err(e.into());
                         }
 
-                        // execute resource transitions
-                        if let Err(e) = baked.encoder.open_pass(hal_label(
-                            Some("(wgpu internal) Transit"),
-                            self.device.instance_flags,
-                        )) {
-                            break 'error Err(e.into());
-                        }
-
+                        // Execute resource transitions, in a command buffer begun by the
+                        // first transition or clear to be recorded.
                         //Note: locking the trackers has to be done after the storages
                         let mut trackers = self.device.trackers.lock();
                         if let Err(e) =
                             baked.initialize_buffer_memory(&mut trackers, &submission.snatch_guard)
                         {
-                            break 'error Err(e.into());
+                            break 'error Err(e);
                         }
                         if let Err(e) = baked.initialize_texture_memory(
                             &mut trackers,
                             &self.device,
                             &submission.snatch_guard,
                         ) {
-                            break 'error Err(e.into());
+                            break 'error Err(e);
                         }
 
                         //Note: stateless trackers are not merged:
                         // device already knows these resources exist.
-                        CommandEncoder::insert_barriers_from_device_tracker(
-                            baked.encoder.raw.as_mut(),
+                        if let Err(e) = CommandEncoder::insert_barriers_from_device_tracker(
+                            &mut baked.encoder,
                             &mut trackers,
                             &baked.trackers,
                             &submission.snatch_guard,
-                        );
-
-                        if let Err(e) = baked.encoder.close_and_push_front() {
+                        ) {
                             break 'error Err(e.into());
+                        }
+
+                        if baked.encoder.is_open {
+                            if let Err(e) = baked.encoder.close_and_push_front() {
+                                break 'error Err(e.into());
+                            }
                         }
 
                         // Transition surface textures into `Present` state.
