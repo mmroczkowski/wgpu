@@ -7,9 +7,9 @@ use core::ops::Range;
 use hashbrown::hash_map::Entry;
 
 use crate::{
-    device::{Device, DeviceError},
+    device::{queue::QueueSubmitError, Device, DeviceError},
     init_tracker::*,
-    resource::{DestroyedResourceError, ParentDevice, RawResourceAccess, Texture, Trackable},
+    resource::{ParentDevice, RawResourceAccess, Texture, Trackable},
     snatch::SnatchGuard,
     track::{DeviceTracker, TextureTracker},
     FastHashMap,
@@ -162,7 +162,7 @@ impl BakedCommands {
         &mut self,
         device_tracker: &mut DeviceTracker,
         snatch_guard: &SnatchGuard<'_>,
-    ) -> Result<(), DestroyedResourceError> {
+    ) -> Result<(), QueueSubmitError> {
         profiling::scope!("initialize_buffer_memory");
 
         // Gather init ranges for each buffer so we can collapse them.
@@ -222,12 +222,14 @@ impl BakedCommands {
 
             let raw_buf = buffer.try_raw(snatch_guard)?;
 
+            let transition = transition.map(|pending| pending.into_hal(&buffer, snatch_guard));
+            if transition.is_none() && ranges.is_empty() {
+                continue;
+            }
+            self.encoder.open_transit_if_closed()?;
+
             unsafe {
-                self.encoder.raw.transition_buffers(
-                    transition
-                        .map(|pending| pending.into_hal(&buffer, snatch_guard))
-                        .as_slice(),
-                );
+                self.encoder.raw.transition_buffers(transition.as_slice());
             }
 
             for range in ranges.iter() {
@@ -263,7 +265,7 @@ impl BakedCommands {
         device_tracker: &mut DeviceTracker,
         device: &Device,
         snatch_guard: &SnatchGuard<'_>,
-    ) -> Result<(), DestroyedResourceError> {
+    ) -> Result<(), QueueSubmitError> {
         profiling::scope!("initialize_texture_memory");
 
         let mut ranges: Vec<TextureInitRange> = Vec::new();
@@ -297,6 +299,7 @@ impl BakedCommands {
 
             // TODO: Could we attempt some range collapsing here?
             for range in ranges.drain(..) {
+                self.encoder.open_transit_if_closed()?;
                 let clear_result = clear_texture(
                     &texture_use.texture,
                     range,
@@ -312,7 +315,7 @@ impl BakedCommands {
                 // and now, this is out of our control so we have to handle
                 // it gracefully.
                 if let Err(ClearError::DestroyedResource(e)) = clear_result {
-                    return Err(e);
+                    return Err(e.into());
                 }
 
                 // Other errors are unexpected.

@@ -806,6 +806,21 @@ impl InnerCommandEncoder {
 
         Ok(self.raw.as_mut())
     }
+
+    /// Begin recording the command buffer that readies resources for the
+    /// encoder's other command buffers, unless it is already being recorded.
+    ///
+    /// A submission calls this only once it has a transition or a clear to
+    /// record, so an encoder needing neither is submitted without one.
+    pub(crate) fn open_transit_if_closed(
+        &mut self,
+    ) -> Result<&mut dyn hal::DynCommandEncoder, DeviceError> {
+        if !self.is_open {
+            self.open_pass(Some("(wgpu internal) Transit"))?;
+        }
+
+        Ok(self.raw.as_mut())
+    }
 }
 
 impl Drop for InnerCommandEncoder {
@@ -1067,11 +1082,11 @@ impl CommandEncoder {
     }
 
     pub(crate) fn insert_barriers_from_device_tracker(
-        raw: &mut dyn hal::DynCommandEncoder,
+        encoder: &mut InnerCommandEncoder,
         base: &mut DeviceTracker,
         head: &Tracker,
         snatch_guard: &SnatchGuard,
-    ) {
+    ) -> Result<(), DeviceError> {
         profiling::scope!("insert_barriers_from_device_tracker");
 
         let buffer_barriers = base
@@ -1084,10 +1099,17 @@ impl CommandEncoder {
             .set_from_tracker_and_drain_transitions(&head.textures, snatch_guard)
             .collect::<Vec<_>>();
 
+        if buffer_barriers.is_empty() && texture_barriers.is_empty() {
+            return Ok(());
+        }
+
+        let raw = encoder.open_transit_if_closed()?;
         unsafe {
             raw.transition_buffers(&buffer_barriers);
             raw.transition_textures(&texture_barriers);
         }
+
+        Ok(())
     }
 
     fn encode_commands(

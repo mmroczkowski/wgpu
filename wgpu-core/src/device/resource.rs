@@ -914,7 +914,15 @@ impl Device {
         // possible and the wait could have been for submissions that finished long ago.
         let mut queue_empty = false;
         if let Some(queue) = self.get_queue() {
-            let queue_result = queue.maintain(current_finished_submission, &snatch_guard);
+            // Only a poll, which every submission ends with, may leave releasing the
+            // finished encoders to the background: a caller that waits does so to find
+            // their resources free afterwards.
+            let encoder_release = match poll_type {
+                wgt::PollType::Poll => crate::device::life::EncoderRelease::InBackground,
+                wgt::PollType::Wait { .. } => crate::device::life::EncoderRelease::AtOnce,
+            };
+            let queue_result =
+                queue.maintain(current_finished_submission, &snatch_guard, encoder_release);
             (
                 user_closures.submissions,
                 user_closures.mappings,
@@ -5193,7 +5201,10 @@ impl Device {
             unsafe { self.raw().wait(self.fence.as_ref(), submission_index, None) }
                 .map_err(|e| self.handle_hal_error(e))?;
             if let Some(queue) = self.get_queue() {
-                let closures = queue.lock_life().triage_submissions(submission_index);
+                let closures = queue.lock_life().triage_submissions(
+                    submission_index,
+                    crate::device::life::EncoderRelease::AtOnce,
+                );
                 assert!(
                     closures.is_empty(),
                     "wait_for_submit is not expected to work with closures"
