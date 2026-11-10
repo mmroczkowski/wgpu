@@ -201,6 +201,24 @@ pub(crate) struct LifetimeTracker {
     /// must happen _after_ all mapped buffer callbacks are mapped, so we defer them
     /// here until the next time the device is maintained.
     work_done_closures: SmallVec<[SubmittedWorkDoneClosure; 1]>,
+
+    /// The thread releasing the encoders of finished submissions, started by
+    /// the first triage that may leave their release to it.
+    encoder_releaser: Option<EncoderReleaser>,
+}
+
+/// When [`LifetimeTracker::triage_submissions`] releases the encoders of the
+/// submissions it finds finished, together with the resources they kept alive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EncoderRelease {
+    /// Before the triage returns, once every encoder left to the background
+    /// earlier is released too. A caller that goes on to depend on the
+    /// resources being free, as configuring a surface does, asks for this.
+    AtOnce,
+
+    /// On another thread where one can be started, as releasing the encoders
+    /// of a frame costs the triaging thread a large part of a submission.
+    InBackground,
 }
 
 impl LifetimeTracker {
@@ -210,6 +228,7 @@ impl LifetimeTracker {
             ready_to_map: Vec::new(),
             ready_to_compact: Vec::new(),
             work_done_closures: SmallVec::new(),
+            encoder_releaser: None,
         }
     }
 
@@ -328,6 +347,7 @@ impl LifetimeTracker {
     pub fn triage_submissions(
         &mut self,
         last_done: SubmissionIndex,
+        encoder_release: EncoderRelease,
     ) -> SmallVec<[SubmittedWorkDoneClosure; 1]> {
         profiling::scope!("triage_submissions");
 
@@ -335,18 +355,43 @@ impl LifetimeTracker {
         let done_count = self.active.partition_point(|a| a.index <= last_done);
 
         let mut work_done_closures: SmallVec<_> = self.work_done_closures.drain(..).collect();
+        let mut finished_encoders = Vec::new();
         for a in self.active.drain(..done_count) {
             self.ready_to_map.extend(a.mapped);
             self.ready_to_compact.extend(a.compact_read_back);
-            for encoder in a.encoders {
-                // This involves actually decrementing the ref count of all command buffer
-                // resources, so can be _very_ expensive.
-                profiling::scope!("drop command buffer trackers");
-                drop(encoder);
-            }
+            finished_encoders.extend(a.encoders);
             work_done_closures.extend(a.work_done_closures);
         }
+        self.release_encoders(finished_encoders, encoder_release);
         work_done_closures
+    }
+
+    /// Release the encoders of finished submissions.
+    ///
+    /// This involves actually decrementing the ref count of all command buffer
+    /// resources, so can be _very_ expensive.
+    fn release_encoders(&mut self, encoders: Vec<EncoderInFlight>, release: EncoderRelease) {
+        match release {
+            EncoderRelease::InBackground => {
+                if encoders.is_empty() {
+                    return;
+                }
+                if self.encoder_releaser.is_none() {
+                    self.encoder_releaser = EncoderReleaser::start();
+                }
+                match &self.encoder_releaser {
+                    Some(releaser) => releaser.release(encoders),
+                    None => drop(encoders),
+                }
+            }
+            EncoderRelease::AtOnce => {
+                if let Some(releaser) = &self.encoder_releaser {
+                    releaser.wait_until_all_released();
+                }
+                profiling::scope!("drop command buffer trackers");
+                drop(encoders);
+            }
+        }
     }
 
     pub fn schedule_resource_destruction(
@@ -433,3 +478,118 @@ impl LifetimeTracker {
         pending_callbacks
     }
 }
+
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+mod encoder_releaser {
+    use alloc::{sync::Arc, vec::Vec};
+    use std::sync::{mpsc, Condvar, Mutex, PoisonError};
+
+    use crate::device::queue::EncoderInFlight;
+
+    /// The batches of encoders handed over and not yet released.
+    #[derive(Default)]
+    struct UnreleasedBatches {
+        count: Mutex<usize>,
+        released: Condvar,
+    }
+
+    impl UnreleasedBatches {
+        fn add_one(&self) {
+            *self.count.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        }
+
+        fn remove_one(&self) {
+            *self.count.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+            self.released.notify_all();
+        }
+    }
+
+    /// Counts a batch as released when dropped, so a release that panics
+    /// leaves nobody waiting for it.
+    struct ReleasedBatch<'a>(&'a UnreleasedBatches);
+
+    impl Drop for ReleasedBatch<'_> {
+        fn drop(&mut self) {
+            self.0.remove_one();
+        }
+    }
+
+    /// A thread that releases the encoders of finished submissions, which
+    /// stops once its owner is dropped and every encoder handed over is released.
+    pub(super) struct EncoderReleaser {
+        encoders: mpsc::Sender<Vec<EncoderInFlight>>,
+        unreleased: Arc<UnreleasedBatches>,
+    }
+
+    impl EncoderReleaser {
+        /// Starts the thread, or returns `None` where the system gives none.
+        pub(super) fn start() -> Option<Self> {
+            let (encoders, handed_over) = mpsc::channel::<Vec<EncoderInFlight>>();
+            let unreleased = Arc::new(UnreleasedBatches::default());
+            let unreleased_by_thread = unreleased.clone();
+            std::thread::Builder::new()
+                .name("wgpu encoder release".into())
+                .spawn(move || {
+                    for encoders in handed_over {
+                        let _released = ReleasedBatch(&unreleased_by_thread);
+                        profiling::scope!("drop command buffer trackers");
+                        drop(encoders);
+                    }
+                })
+                .ok()?;
+            Some(Self {
+                encoders,
+                unreleased,
+            })
+        }
+
+        pub(super) fn release(&self, encoders: Vec<EncoderInFlight>) {
+            self.unreleased.add_one();
+            if let Err(mpsc::SendError(encoders)) = self.encoders.send(encoders) {
+                let _released = ReleasedBatch(&self.unreleased);
+                drop(encoders);
+            }
+        }
+
+        pub(super) fn wait_until_all_released(&self) {
+            let mut count = self
+                .unreleased
+                .count
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            while *count > 0 {
+                count = self
+                    .unreleased
+                    .released
+                    .wait(count)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+    }
+}
+
+#[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+mod encoder_releaser {
+    use alloc::vec::Vec;
+
+    use crate::device::queue::EncoderInFlight;
+
+    /// Never started where there are no threads to release encoders on.
+    pub(super) enum EncoderReleaser {}
+
+    impl EncoderReleaser {
+        pub(super) fn start() -> Option<Self> {
+            None
+        }
+
+        pub(super) fn release(&self, _encoders: Vec<EncoderInFlight>) {
+            match *self {}
+        }
+
+        pub(super) fn wait_until_all_released(&self) {
+            match *self {}
+        }
+    }
+}
+
+use encoder_releaser::EncoderReleaser;
